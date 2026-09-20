@@ -66,6 +66,60 @@ static void SndNormalizePath(char* pszDst, size_t nDst, const char* pszSrc)
     pszDst[i] = 0;
 }
 
+// The game names its sound files relative to its own directory ("sfx\\bong.wav"), because on
+// Win32 that was always the working directory. Resolve such a name against the data directory
+// first — the same root the data files and the INI come from — and fall back to the working
+// directory. Each is tried as given and lowercased, since the DTA names files in mixed case.
+static void* SndLoadRelative(void* (*pfnLoad)(const char*), const char* pszRel)
+{
+    char szLower[512];
+    size_t i = 0;
+    for (; pszRel[i] != 0 && i + 1 < sizeof szLower; i++)
+        szLower[i] = (char)tolower((unsigned char)pszRel[i]);
+    szLower[i] = 0;
+    const char* apszName[2] = { pszRel, szLower };
+
+    char szDir[512];
+    szDir[0] = 0;
+    if (pszRel[0] != '/')
+    {
+        GetModuleFileNameA(0, szDir, sizeof szDir);
+        char* pSlash = strrchr(szDir, '/');
+        if (pSlash != NULL)
+            pSlash[1] = 0;
+        else
+            szDir[0] = 0;
+    }
+
+    for (int nBase = 0; nBase < 2; nBase++)
+    {
+        if (nBase == 0 && szDir[0] == 0)
+            continue;
+        for (int n = 0; n < 2; n++)
+        {
+            if (n == 1 && strcmp(apszName[0], apszName[1]) == 0)
+                continue;
+            char szTry[512];
+            if (nBase == 0)
+            {
+                if (strlen(szDir) + strlen(apszName[n]) + 1 > sizeof szTry)
+                    continue;
+                strcpy(szTry, szDir);
+                strcat(szTry, apszName[n]);
+            }
+            else
+            {
+                strncpy(szTry, apszName[n], sizeof szTry - 1);
+                szTry[sizeof szTry - 1] = 0;
+            }
+            void* pLoaded = pfnLoad(szTry);
+            if (pLoaded != NULL)
+                return pLoaded;
+        }
+    }
+    return NULL;
+}
+
 // open the backend device once (WaveMixInit, and MCI opens sequencers independently of the
 // SFX session — DESKADV FUN_1018_4c54 tail)
 static bool SndEnsureSession(void)
@@ -104,13 +158,7 @@ int WaveMixOpenWave(int hMixSession, char* szWaveFilename, int /*hInst*/, DWORD 
         return 0;
     char szPath[512];
     SndNormalizePath(szPath, sizeof szPath, szWaveFilename);
-    void* pWave = MfxSndPlatLoadWave(szPath);
-    if (pWave == NULL)
-    {
-        for (char* p = szPath; *p; p++)
-            *p = (char)tolower((unsigned char)*p);
-        pWave = MfxSndPlatLoadWave(szPath);
-    }
+    void* pWave = SndLoadRelative(MfxSndPlatLoadWave, szPath);
     if (pWave == NULL)
     {
         SNDLOG((stderr, "[snd] open FAILED \"%s\"\n", szWaveFilename));
@@ -286,7 +334,7 @@ extern "C" MCIERROR mciSendStringA(LPCSTR cmd, LPSTR /*ret*/, UINT /*cchRet*/, H
         SndNormalizePath(szPath, sizeof szPath, pszFile);
         if (!SndEnsureSession())                           // MIDI opens the device even when
             return 1;                                      // WaveMix failed/was skipped
-        void* pMusic = MfxSndPlatMusicLoad(szPath);
+        void* pMusic = SndLoadRelative(MfxSndPlatMusicLoad, szPath);
         if (pMusic == NULL)
         {
             SNDLOG((stderr, "[snd] mci open FAILED \"%s\"\n", szPath));

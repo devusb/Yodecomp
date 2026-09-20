@@ -29,6 +29,7 @@
 
 // SDL3 native file picker (mfxplat.h contract); SDL2/null/DS return -1 → custom picker fallback.
 extern "C" int MfxPlatShowFileDialog(int, const char *, const char *, const char *, char *, int);
+extern "C" const char *MfxStateDir(void);   // app/mfxstubs.cpp
 #ifdef __ANDROID__
 extern "C" const char *MfxAndroidDataDir(void);   // app's writable internal storage (mfxplat_sdl3.cpp)
 #endif
@@ -658,6 +659,10 @@ int CFileDialog::DoModal()
     const char *pszDir = (m_ofn.lpstrInitialDir && *m_ofn.lpstrInitialDir) ? m_ofn.lpstrInitialDir : ".";
     std::error_code ecDir;
     if (!std::filesystem::is_directory(pszDir, ecDir)) pszDir = ".";
+    // Saves belong with the rest of the writable state, not beside the read-only data the
+    // game derives lpstrInitialDir from.
+    const char *pszState = MfxStateDir();
+    if (pszState != NULL && *pszState != 0) pszDir = pszState;
 #ifdef __ANDROID__
     // On Android the process cwd (".") is "/", which is not writable — root the picker at the app's
     // private internal storage instead (the writable, persistent dir the APK's assets extract into,

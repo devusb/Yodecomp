@@ -42,6 +42,10 @@ static int s_nTexW = 0, s_nTexH = 0;           // current streaming-texture size
 // shown while the player is touching, hidden once a keyboard/mouse/controller is used, re-shown
 // on the next touch. Default 1 (touch is the assumed input on a phone at launch).
 static int s_bTouchActive = 1;
+// YODA_WINDOW pins the window to a fixed size instead of an integer multiple of the game, for a
+// panel whose size the game does not divide. The renderer then letterboxes the game into it, so
+// the logical space is game pixels and everything derived from it is 1:1, exactly as on Android.
+static int s_bFixedWin = 0;
 
 // Soft-cursor composite scale. Desktop composites in window pixels (×s_nScale); Android composites
 // in the renderer's game-pixel LOGICAL space (letterbox path), so the cursor is 1:1 there — using
@@ -51,7 +55,7 @@ static int MfxCursorScale(void)
 #ifdef __ANDROID__
     return 1;
 #else
-    return s_nScale;
+    return s_bFixedWin ? 1 : s_nScale;
 #endif
 }
 
@@ -167,7 +171,29 @@ extern "C" int MfxPlatInit(const char *pszTitle, int nW, int nH, int nScale)
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     nWinFlags = SDL_WINDOW_FULLSCREEN;         // Android ignores the requested size → fullscreen
 #endif
-    s_pWin = SDL_CreateWindow(pszTitle, nW * s_nScale, nH * s_nScale, nWinFlags);
+    // YODA_WINDOW pins the window instead of sizing it to an integer multiple of the game:
+    // "display" fills the screen the window opens on, or an explicit "<W>x<H>". Deliberately
+    // not SDL_WINDOW_FULLSCREEN — asking a kiosk compositor to go fullscreen after mapping is
+    // what deadlocks other SDL clients under cage; an ordinary window at the display's size
+    // fills the panel just as well.
+    int nWinW = nW * s_nScale, nWinH = nH * s_nScale;
+    if (const char *pszWin = getenv("YODA_WINDOW")) {
+        int w = 0, h = 0;
+        if (strcmp(pszWin, "display") == 0) {
+            SDL_Rect rcDisp;
+            SDL_DisplayID nDisp = SDL_GetPrimaryDisplay();
+            if (nDisp != 0 && SDL_GetDisplayUsableBounds(nDisp, &rcDisp)) {
+                w = rcDisp.w; h = rcDisp.h;
+            }
+        } else {
+            sscanf(pszWin, "%dx%d", &w, &h);
+        }
+        if (w > 0 && h > 0) {
+            nWinW = w; nWinH = h;
+            s_bFixedWin = 1;                   // needs the renderer's letterbox, forced below
+        }
+    }
+    s_pWin = SDL_CreateWindow(pszTitle, nWinW, nWinH, nWinFlags);
     if (!s_pWin) {
         fprintf(stderr, "microfx: SDL_CreateWindow: %s\n", SDL_GetError());
         SDL_Quit();
@@ -184,7 +210,7 @@ extern "C" int MfxPlatInit(const char *pszTitle, int nW, int nH, int nScale)
     // to the game's pixels, so the integer window-surface scale can't work); desktop opts in with
     // YODA_ACCEL. On Android the logical size is the game pixels (not ×scale), so touch coords map
     // straight through SDL_RenderCoordinatesFromWindow; MfxPresentAccel re-fits it per frame.
-    int bWantRenderer = (getenv("YODA_ACCEL") != 0);
+    int bWantRenderer = (getenv("YODA_ACCEL") != 0) || s_bFixedWin;
 #ifdef __ANDROID__
     bWantRenderer = 1;
 #endif
@@ -195,7 +221,8 @@ extern "C" int MfxPlatInit(const char *pszTitle, int nW, int nH, int nScale)
 #ifdef __ANDROID__
             int nLogW = nW, nLogH = nH;
 #else
-            int nLogW = nW * s_nScale, nLogH = nH * s_nScale;
+            int nLogW = s_bFixedWin ? nW : nW * s_nScale;
+            int nLogH = s_bFixedWin ? nH : nH * s_nScale;
 #endif
             SDL_SetRenderLogicalPresentation(s_pRen, nLogW, nLogH,
                                              SDL_LOGICAL_PRESENTATION_LETTERBOX);
@@ -252,6 +279,10 @@ extern "C" int MfxPlatShowFileDialog(int bOpen, const char *pszDir, const char *
                                      const char *pszDef, char *pszOut, int nOutSize)
 {
     if (!s_pWin) return -1;
+    // The native panel is a separate toplevel driven by a pointer and a keyboard, which a
+    // kiosk compositor will not focus and a handheld has neither of. CFileDialog's in-window
+    // list is all buttons and needs no typing.
+    if (getenv("YODA_INWINDOW_FILES")) return -1;
 #if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
     // No usable native picker here → CFileDialog's in-window row-list fallback.
     //  · browser: SDL3 has no picker.
@@ -323,6 +354,12 @@ static void MfxScaleXY(float rx, float ry, int *px, int *py)
     if (s_pRen) SDL_RenderCoordinatesFromWindow(s_pRen, rx, ry, &gx, &gy);
     *px = (int)gx; *py = (int)gy;
 #else
+    if (s_bFixedWin && s_pRen) {
+        float gx = rx, gy = ry;
+        SDL_RenderCoordinatesFromWindow(s_pRen, rx, ry, &gx, &gy);
+        *px = (int)gx; *py = (int)gy;
+        return;
+    }
     *px = (int)rx / s_nScale;
     *py = (int)ry / s_nScale;
 #endif

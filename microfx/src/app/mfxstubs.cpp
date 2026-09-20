@@ -5,6 +5,9 @@
 #include <afxcmn.h>
 #include <mfxplat.h>           // MfxPlatMinimize (SC_MINIMIZE / "Hide Me!")
 #include <ctype.h>             // tolower (INI profile lookup)
+#include <stdlib.h>            // getenv (YODA_DATA_DIR)
+#include <stdio.h>             // snprintf (MfxStateDir)
+#include <filesystem>          // create_directories (MfxStateDir)
 #ifdef __APPLE__
 #include <mach-o/dyld.h>       // _NSGetExecutablePath (GetModuleFileNameA)
 #elif defined(_WIN32)
@@ -311,10 +314,65 @@ void CWinApp::OnContextHelp() {}
 // profile settings — real INI store, "<exebase>.INI" next to the executable (the Win32 build
 // keeps the same [OPTIONS]/[GameData] format in <exe>.INI in the Windows dir, so a bottle's
 // INI can be copied over verbatim — that is how the M0 worldgen oracle aligns settings).
+// Where the game writes: its INI and its saved games. YODA_STATE_DIR names that directory
+// outright, for an installed build whose data is on a read-only filesystem. Otherwise Linux
+// follows the XDG base directory spec; every other platform keeps resolving beside the
+// executable, as the game always has.
+extern "C" const char* MfxStateDir(void)
+{
+    static char szDir[1024];
+    static int bResolved = 0;
+    if (bResolved)
+        return szDir[0] != 0 ? szDir : NULL;
+    bResolved = 1;
+    szDir[0] = 0;
+
+    const char* pszEnv = getenv("YODA_STATE_DIR");
+    if (pszEnv != NULL && *pszEnv != 0)
+    {
+        strncpy(szDir, pszEnv, sizeof szDir - 1);
+        szDir[sizeof szDir - 1] = 0;
+    }
+#if defined(__linux__) && !defined(__ANDROID__)
+    else
+    {
+        const char* pszData = getenv("XDG_DATA_HOME");
+        const char* pszHome = getenv("HOME");
+        if (pszData != NULL && *pszData != 0)
+            snprintf(szDir, sizeof szDir, "%s/yodecomp", pszData);
+        else if (pszHome != NULL && *pszHome != 0)
+            snprintf(szDir, sizeof szDir, "%s/.local/share/yodecomp", pszHome);
+    }
+#endif
+
+    if (szDir[0] != 0)
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(szDir, ec);
+    }
+    return szDir[0] != 0 ? szDir : NULL;
+}
+
 static void MfxProfilePath(char* szIni, size_t nCap)
 {
     char szExe[1024];
     GetModuleFileNameA(0, szExe, sizeof(szExe));
+    const char* pszState = MfxStateDir();
+    if (pszState != NULL && *pszState != 0)
+    {
+        const char* pszName = strrchr(szExe, '/');
+        pszName = (pszName != NULL) ? pszName + 1 : szExe;
+        size_t nDir = strlen(pszState);
+        if (nDir + strlen(pszName) + 2 < sizeof szExe)
+        {
+            char szJoin[1024];
+            strcpy(szJoin, pszState);
+            if (nDir > 0 && szJoin[nDir - 1] != '/')
+                strcat(szJoin, "/");
+            strcat(szJoin, pszName);
+            strcpy(szExe, szJoin);
+        }
+    }
     strncpy(szIni, szExe, nCap - 5);
     szIni[nCap - 5] = 0;
     char* pDot = strrchr(szIni, '.');
@@ -557,6 +615,26 @@ DWORD    GetModuleFileNameA(HINSTANCE, LPSTR lpFilename, DWORD nSize)
     ssize_t n = readlink("/proc/self/exe", szBuf, sizeof(szBuf) - 1);
     if (n > 0) szBuf[n] = 0; else szBuf[0] = 0;
 #endif
+    // YODA_DATA_DIR replaces the directory part of the reported path. The game
+    // derives its data files, its INI and its save files from this directory,
+    // so pointing it at a writable one is equivalent to running the executable
+    // from there. Installs whose executable directory is read-only need it.
+    const char *pszDataDir = getenv("YODA_DATA_DIR");
+    if (pszDataDir && *pszDataDir) {
+        const char *pszName = szBuf;
+        for (const char *p = szBuf; *p; p++)
+            if (*p == '/' || *p == '\\') pszName = p + 1;
+        if (!*pszName) pszName = "yoda";
+        char szDir[sizeof szBuf];
+        size_t nDir = strlen(pszDataDir);
+        if (nDir > sizeof szDir - 2) nDir = sizeof szDir - 2;
+        memcpy(szDir, pszDataDir, nDir);
+        if (nDir == 0 || (szDir[nDir - 1] != '/' && szDir[nDir - 1] != '\\'))
+            szDir[nDir++] = '/';
+        strncpy(szDir + nDir, pszName, sizeof szDir - nDir - 1);
+        szDir[sizeof szDir - 1] = 0;
+        memcpy(szBuf, szDir, sizeof szBuf);
+    }
     strncpy(lpFilename, szBuf, nSize - 1);
     lpFilename[nSize - 1] = 0;
     return (DWORD)strlen(lpFilename);
