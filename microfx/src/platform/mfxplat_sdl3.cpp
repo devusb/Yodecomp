@@ -66,6 +66,7 @@ static SDL_Texture  *s_pFrameTex = 0;
 
 // soft-cursor state (MfxPlatSetCursor decides; MfxPlatPresent composites)
 static SDL_Surface *s_pCursorSurf = 0;
+static SDL_Surface *s_pCursorLast = 0;   // last real image, reused by pad pointer mode
 static int s_xHot = 0, s_yHot = 0;
 
 // ── Android: data dir + APK-asset extraction ─────────────────────────────────────────────────
@@ -472,6 +473,44 @@ static int MfxPadPop(MFXPLATEVENT *pEv)
     s_padQHead = (s_padQHead + 1) % 8;
     return 1;
 }
+static void MfxPadPushXY(int nType, int x, int y)
+{
+    int nNext = (s_padQTail + 1) % 8;
+    if (nNext == s_padQHead) return;
+    s_padQ[s_padQTail].nType = nType;
+    s_padQ[s_padQTail].nVk = s_padQ[s_padQTail].nChar = 0;
+    s_padQ[s_padQTail].x = x;
+    s_padQ[s_padQTail].y = y;
+    s_padQTail = nNext;
+}
+
+// ── pad pointer mode ────────────────────────────────────────────────────────────────────────
+// The game is mouse-driven: inventory items are dragged onto the world, and the menu bar, the
+// dialogs and the save/load picker are all click-driven. A pad with no stick and no touchscreen
+// has no way to do any of that, so Y toggles between walking and steering a pointer. A is the
+// left button, held across the motion so drags work; the D-pad moves the cursor instead of the
+// hero. The cursor accelerates while held: fine enough to hit an inventory slot, fast enough to
+// cross the window.
+static SDL_Gamepad *s_pPad = 0;                // most recently opened pad (cursor stepping)
+static int    s_bPadCursor  = 0;               // pointer mode on
+static int    s_padCurX = 0, s_padCurY = 0;    // cursor position, game pixels
+static Uint32 s_padCurStepT = 0;               // last cursor step
+static Uint32 s_padCurHoldT = 0;               // when the current direction began
+static int    s_bPadCurBtn  = 0;               // A held → left button down
+
+#define MFX_PADCUR_MS       16                 // step interval
+#define MFX_PADCUR_SLOW      1                 // px/step before the ramp
+#define MFX_PADCUR_FAST      6                 // px/step at full ramp
+#define MFX_PADCUR_RAMP_MS 250                 // held this long before it speeds up
+#define MFX_PADCUR_FULL_MS 650                 // held this long to reach FAST
+
+// The game hides the cursor for its own keyboard/drag modes. Pointer mode needs one on screen
+// regardless, so fall back to the last image the game asked for.
+static void MfxPadCursorShow(void)
+{
+    if (!s_pCursorSurf && s_pCursorLast) s_pCursorSurf = s_pCursorLast;
+}
+
 static int MfxPadDirVk(int dx, int dy)         // (dx,dy)∈{-1,0,1} → the game's 8 movement VKs
 {
     if (dx < 0 && dy < 0) return VK_HOME;      // ↖ 0x24
@@ -506,6 +545,49 @@ static void MfxPadRecompute(SDL_Gamepad *pGp)  // fold D-pad + both sticks → o
         s_padDirVk = vk;
         s_padRepeatT = SDL_GetTicks();         // fire the first repeat a full interval from now
     }
+}
+
+// One cursor step, emitted as a MOUSEMOVE. Returns 0 when there is nothing to move.
+static int MfxPadCursorStep(MFXPLATEVENT *pEv)
+{
+    if (!s_bPadCursor || !s_pPad) return 0;
+    Uint32 now = SDL_GetTicks();
+    if (now - s_padCurStepT < MFX_PADCUR_MS) return 0;
+
+    const int T = 16000;
+    int dx = 0, dy = 0;
+    if (SDL_GetGamepadButton(s_pPad, SDL_GAMEPAD_BUTTON_DPAD_LEFT))  dx--;
+    if (SDL_GetGamepadButton(s_pPad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) dx++;
+    if (SDL_GetGamepadButton(s_pPad, SDL_GAMEPAD_BUTTON_DPAD_UP))    dy--;
+    if (SDL_GetGamepadButton(s_pPad, SDL_GAMEPAD_BUTTON_DPAD_DOWN))  dy++;
+    int lx = SDL_GetGamepadAxis(s_pPad, SDL_GAMEPAD_AXIS_LEFTX);
+    int ly = SDL_GetGamepadAxis(s_pPad, SDL_GAMEPAD_AXIS_LEFTY);
+    if (lx < -T) dx--; else if (lx > T) dx++;
+    if (ly < -T) dy--; else if (ly > T) dy++;
+    if (dx < -1) dx = -1; else if (dx > 1) dx = 1;
+    if (dy < -1) dy = -1; else if (dy > 1) dy = 1;
+
+    if (!dx && !dy) { s_padCurHoldT = 0; return 0; }
+    s_padCurStepT = now;
+    if (!s_padCurHoldT) s_padCurHoldT = now;
+
+    Uint32 nHeld = now - s_padCurHoldT;
+    int nStep = MFX_PADCUR_SLOW;
+    if (nHeld >= MFX_PADCUR_FULL_MS)
+        nStep = MFX_PADCUR_FAST;
+    else if (nHeld > MFX_PADCUR_RAMP_MS)
+        nStep += (int)((nHeld - MFX_PADCUR_RAMP_MS) * (MFX_PADCUR_FAST - MFX_PADCUR_SLOW)
+                       / (MFX_PADCUR_FULL_MS - MFX_PADCUR_RAMP_MS));
+
+    s_padCurX += dx * nStep;
+    s_padCurY += dy * nStep;
+    if (s_padCurX < 0) s_padCurX = 0; else if (s_padCurX > s_nW - 1) s_padCurX = s_nW - 1;
+    if (s_padCurY < 0) s_padCurY = 0; else if (s_padCurY > s_nH - 1) s_padCurY = s_nH - 1;
+
+    pEv->nType = MFXPLAT_EV_MOUSEMOVE;
+    pEv->x = s_padCurX;
+    pEv->y = s_padCurY;
+    return 1;
 }
 
 // ── events ───────────────────────────────────────────────────────────────────────────────────
@@ -660,34 +742,70 @@ extern "C" int MfxPlatPollEvent(MFXPLATEVENT *pEv)
             return 1;
         }
         case SDL_EVENT_GAMEPAD_ADDED:
-            SDL_OpenGamepad(ev.gdevice.which);      // must open to receive its button/axis events
+            s_pPad = SDL_OpenGamepad(ev.gdevice.which);  // must open to receive button/axis events
             s_bTouchActive = 0;
             break;
         case SDL_EVENT_GAMEPAD_REMOVED: {
             SDL_Gamepad *pGp = SDL_GetGamepadFromID(ev.gdevice.which);
-            if (pGp) SDL_CloseGamepad(pGp);
+            if (pGp) {
+                if (pGp == s_pPad) s_pPad = 0;
+                SDL_CloseGamepad(pGp);
+            }
             break;
         }
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         case SDL_EVENT_GAMEPAD_BUTTON_UP: {
             s_bTouchActive = 0;
             int bDown = (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
-            if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH)        // A → Attack (Space)
+            if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH) {     // Y → toggle pointer mode
+                if (bDown) {
+                    if (s_bPadCurBtn) {                              // end a drag in progress
+                        s_bPadCurBtn = 0;
+                        MfxPadPushXY(MFXPLAT_EV_LUP, s_padCurX, s_padCurY);
+                    }
+                    s_bPadCursor = !s_bPadCursor;
+                    s_padCurHoldT = 0;
+                    if (s_bPadCursor) {
+                        if (s_padDirVk) {                            // stop walking
+                            MfxPadPush(MFXPLAT_EV_KEYUP, s_padDirVk);
+                            s_padDirVk = 0;
+                        }
+                        MfxPadCursorShow();
+                        MfxPadPushXY(MFXPLAT_EV_MOUSEMOVE, s_padCurX, s_padCurY);
+                    }
+                }
+            }
+            // The primary action sits on EAST, not SOUTH. SDL calls the bottom button the
+            // primary one, which is right on a pad whose bottom button is labelled A; these
+            // handhelds use the Nintendo layout, where the bottom button is labelled B and
+            // the right one is A.
+            else if (s_bPadCursor && ev.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) {
+                s_bPadCurBtn = bDown;                                // A → left button (drag)
+                MfxPadPushXY(bDown ? MFXPLAT_EV_LDOWN : MFXPLAT_EV_LUP, s_padCurX, s_padCurY);
+            }
+            else if (s_bPadCursor && ev.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH)
+                MfxPadPush(bDown ? MFXPLAT_EV_KEYDOWN : MFXPLAT_EV_KEYUP, VK_ESCAPE);
+            else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)   // A → Attack (Space)
                 MfxPadPush(bDown ? MFXPLAT_EV_KEYDOWN : MFXPLAT_EV_KEYUP, VK_SPACE);
-            else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)   // B → Push/Pull (Shift)
+            else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH)  // B → Push/Pull (Shift)
                 MfxPadPush(bDown ? MFXPLAT_EV_KEYDOWN : MFXPLAT_EV_KEYUP, VK_SHIFT);
             else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_WEST)   // X → Enter (dismiss dialogs)
                 MfxPadPush(bDown ? MFXPLAT_EV_KEYDOWN : MFXPLAT_EV_KEYUP, VK_RETURN);
             else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)   // Select → Locator map ('L')
                 MfxPadPush(bDown ? MFXPLAT_EV_KEYDOWN : MFXPLAT_EV_KEYUP, 'L');
-            else                                                     // D-pad → recompute 8-way
+            // Start → Pause. 'P' is the game's own accelerator for ID_OPTIONS_PAUSE (RT_ACCELERATOR
+            // id 2, the one entry with no Ctrl), so this routes through TranslateAccelerator into
+            // the same WM_COMMAND the menu item sends, checkmark and all.
+            else if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_START)
+                MfxPadPush(bDown ? MFXPLAT_EV_KEYDOWN : MFXPLAT_EV_KEYUP, 'P');
+            else if (!s_bPadCursor)                                  // D-pad → recompute 8-way
                 MfxPadRecompute(SDL_GetGamepadFromID(ev.gbutton.which));
             if (MfxPadPop(pEv)) return 1;
             break;
         }
         case SDL_EVENT_GAMEPAD_AXIS_MOTION:
             s_bTouchActive = 0;
-            MfxPadRecompute(SDL_GetGamepadFromID(ev.gaxis.which));
+            if (!s_bPadCursor) MfxPadRecompute(SDL_GetGamepadFromID(ev.gaxis.which));
             if (MfxPadPop(pEv)) return 1;
             break;
 #ifdef __ANDROID__
@@ -748,6 +866,8 @@ extern "C" int MfxPlatPollEvent(MFXPLATEVENT *pEv)
     // Held-direction auto-repeat: the game needs a fresh WM_KEYDOWN each tick to keep walking, so
     // re-issue the held 8-way direction on a timer (≥ the game tick). Only when SDL has no more
     // events, and at most one per drain cycle, so the pump still reaches present().
+    if (MfxPadCursorStep(pEv)) return 1;
+
     if (s_padDirVk) {
         Uint32 now = SDL_GetTicks();
         if (now - s_padRepeatT >= 33) {
@@ -988,12 +1108,14 @@ extern "C" void MfxPlatSetCursor(int nMode, const MFXIMG *pImg, const void *pKey
     if (nHwMode < 0) nHwMode = getenv("YODA_HWCURSOR") ? 1 : 0;
 
     if (nMode == MFXPLAT_CURSOR_SYSTEM) {
-        s_pCursorSurf = 0;
-        SDL_ShowCursor();
+        // Pad pointer mode drives a cursor the OS knows nothing about, so the plain arrow the
+        // game asks for over the sidebar and the menu bar has to be composited like any other.
+        s_pCursorSurf = (s_bPadCursor && s_pCursorLast) ? s_pCursorLast : 0;
+        if (s_pCursorSurf) SDL_HideCursor(); else SDL_ShowCursor();
         return;
     }
     if (nMode == MFXPLAT_CURSOR_HIDDEN || !pImg) {
-        s_pCursorSurf = 0;
+        s_pCursorSurf = (s_bPadCursor && s_pCursorLast) ? s_pCursorLast : 0;
         SDL_HideCursor();
         return;
     }
@@ -1016,6 +1138,7 @@ extern "C" void MfxPlatSetCursor(int nMode, const MFXIMG *pImg, const void *pKey
         SDL_ShowCursor();
     } else {
         s_pCursorSurf = aCache[nHit].pSurf;
+        s_pCursorLast = s_pCursorSurf;
         s_xHot = xHot;
         s_yHot = yHot;
         SDL_HideCursor();                            // we draw it ourselves
